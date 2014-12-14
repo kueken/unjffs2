@@ -1,0 +1,31 @@
+Hi,
+
+this tool converts a NFI image into a CF image.
+
+It does this by first extracting the different jffs2 images into files, then
+using the included "dump" tool to unpack them.
+
+Then, a rootfs-image is created using "genext2fs", which must be installed!
+
+So,
+
+first compile the jffs2 tool using "make",
+
+then run 
+
+./ripimage.py dreambox-image-dm7025-20060318161653.nfi
+
+which will result in a "root.ext2" file and a "boot" directory.
+
+create two partitions on a compact flash disk, format the first one as VFAT
+(should be ~4MB), copy the boot/ contents there.
+
+then rawwrite the root.ext2 file into the second partition (60MB by default,
+can be changed in ripimage.py)
+
+this can probably be improved to do this automatically. A problem is that
+there is no tool (at least none that i knew of) to create a msdos filesystem
+without being root (i.e. with kernel help, loopmounts etc.).
+
+regards,
+Felix <felix.domke@multimedia-labs.de>
