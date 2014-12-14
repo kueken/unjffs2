@@ -1,6 +1,9 @@
-all: dump
+all: unjffs2
 
-OBJECTS = crc32.o mini_inflate.o dump.o
+OBJECTS = crc32.o mini_inflate.o unjffs2.o
 
-dump: $(OBJECTS)
-	g++ $(OBJECTS) -o dump
+unjffs2: $(OBJECTS)
+	$(CXX) $(OBJECTS) -o unjffs2
+
+clean:
+	rm -f *.o unjffs2
