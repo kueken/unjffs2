@@ -3,13 +3,13 @@
  * algorithm is memory intensive but has (almost) linear complexity.
  * at first, the jffs2 is unpacked and put into a map, inode data blocks
  * sorted by version number.
- * then the data blocks are "replayed" in correct order, and memcpy'ed 
+ * then the data blocks are "replayed" in correct order, and memcpy'ed
  * into a buffer.
  *
  * usage: jffs2_unpack <jffs2 file> <output directory> <endianess>
  * ...where endianess is 4321 for big endian or 1234 for little endian.
  *
- * SECURITY NOTE: as you need to run this program as root, you could 
+ * SECURITY NOTE: as you need to run this program as root, you could
  * easily build a fake-jffs2 file with relative pathnames, thus overwriting
  * any file on the host system! BE AWARE OF THIS!
  * (this could be easily avoided by checking directory. however, i don't
@@ -19,6 +19,9 @@
  * License: GPL (due to the used unpack algorithms)
  *
  *                          (C) 2006 Felix Domke <tmbinc@elitedvb.net>
+ *
+ * Hacked by noggie to use a two-pass approach, in order to bring down
+ * memory requirements.
  */
 
 #include <stdio.h>
@@ -38,6 +41,8 @@ extern unsigned long crc32_no_comp(unsigned long crc, const unsigned char *buf, 
 #include "jffs2.h"
 
 int swap_words;
+int no_devtab;
+int two_pass;
 
 unsigned short fix16(unsigned short c)
 {
@@ -106,7 +111,7 @@ void rubin_do_decompress(unsigned char *bits, unsigned char *in,
 					in += 4;
 				}
 			}
-			i0 =  (bits[i] * p) >> 8;
+			i0 = (bits[i] * p) >> 8;
 
 			if (i0 <= 0) i0 = 1;
 			/* if it fails, it fails, we have our crc
@@ -179,7 +184,7 @@ void rtime_decompress(unsigned char *data_in, unsigned char *cpage_out,
 long zlib_decompress(unsigned char *data_in, unsigned char *cpage_out,
 		      __u32 srclen, __u32 destlen)
 {
-    return (decompress_block(cpage_out, data_in + 2, memcpy));
+	return (decompress_block(cpage_out, data_in + 2, memcpy));
 }
 
 int do_uncompress(void *dst, int dstlen, void *src, int srclen, int type)
@@ -224,16 +229,37 @@ struct nodedata_s
 	unsigned char *data;
 	int size;
 	int offset;
-	
+	FILE *f;
+	off_t foffset;
+	int uncompr_size;
+	int compr;
+
 	int isize, gid, uid, mode;
-	
+
 	nodedata_s(unsigned char *_data, int _size, int _offset, int _isize, int _gid, int _uid, int _mode)
 	{
 		data = (unsigned char*)malloc(_size);
 		size = _size;
 		offset = _offset;
 		memcpy(data, _data, size);
-		
+
+		isize = _isize;
+		gid = _gid;
+		uid = _uid;
+		mode = _mode;
+	}
+	nodedata_s(FILE *_f, off_t _foffset, int _uncompr_size, int _compr, int _size, int _offset, int _isize, int _gid, int _uid, int _mode)
+	{
+		f = _f;
+		foffset = _foffset;
+		uncompr_size = _uncompr_size;
+		compr = _compr;
+
+		data = NULL;
+
+		size = _size;
+		offset = _offset;
+
 		isize = _isize;
 		gid = _gid;
 		uid = _uid;
@@ -261,9 +287,9 @@ FILE *devtab;
 void do_list(int inode, std::string root="")
 {
 	std::string pathname = prefix + root + inodes[inode];
-	
+
 	std::map<int, struct nodedata_s> &data = nodedata[inode];
-	
+
 	int max_size = 0, gid = 0, uid = 0, mode = 0755;
 	if (!data.empty())
 	{
@@ -274,13 +300,13 @@ void do_list(int inode, std::string root="")
 		gid = last->second.gid;
 		uid = last->second.uid;
 	}
-	
+
 	if ((node_type[inode] == DT_BLK) || (node_type[inode] == DT_CHR))
 		max_size = 2;
-	
+
 	unsigned char *merged_data = (unsigned char*)calloc(1, max_size + 1);
 	int devtab_type = 0, major = 0, minor = 0;
-	
+
 	for (std::map<int, struct nodedata_s>::iterator i(data.begin()); i != data.end(); ++i)
 	{
 		int size = i->second.size;
@@ -288,9 +314,21 @@ void do_list(int inode, std::string root="")
 		if (offset + size > max_size)
 			size = max_size - offset;
 		if (size > 0)
-			memcpy(merged_data + i->second.offset, i->second.data, i->second.size);
+		{
+			if (!i->second.data)
+			{
+				unsigned char compr[i->second.size], uncomp[i->second.uncompr_size];
+				fseeko(i->second.f, i->second.foffset, SEEK_SET);
+				fread(compr, i->second.size, 1, i->second.f);
+				if (do_uncompress(uncomp, i->second.uncompr_size, compr, i->second.size, i->second.compr) != i->second.uncompr_size)
+						fprintf(stderr, "  ** data uncompress failed!\n");
+				else
+					memcpy(merged_data + i->second.offset, uncomp, i->second.size);
+			} else
+				memcpy(merged_data + i->second.offset, i->second.data, i->second.size);
+		}
 	}
-	
+
 	switch (node_type[inode])
 	{
 	case DT_DIR:
@@ -327,7 +365,7 @@ void do_list(int inode, std::string root="")
 			if (!whine++)
 				perror("mknod");
 		}
-		
+
 		if (node_type[inode] == DT_BLK)
 			devtab_type = 'b';
 		else
@@ -342,6 +380,8 @@ void do_list(int inode, std::string root="")
 		break;
 	}
 
+	free(merged_data);
+
 	if (devtab_type && devtab && (inode != 1))
 		fprintf(devtab, "%s %c %o %d %d %d %d - - -\n", (root + inodes[inode]).c_str(), devtab_type, mode & 07777, uid, gid, major, minor);
 
@@ -350,7 +390,7 @@ void do_list(int inode, std::string root="")
 		if (chmod(pathname.c_str(), mode))
 			if (!whine++)
 				perror("chmod");
-		
+
 		if (chown(pathname.c_str(), uid, gid))
 			if (!whine++)
 				perror("chown");
@@ -361,40 +401,58 @@ void do_list(int inode, std::string root="")
 		do_list(*i, root + inodes[inode].c_str() + "/");
 }
 
+void usage(char *prog_name) {
+	fprintf(stderr, "usage: %s [--no-devtab] [--two-pass] <jffs2 file> <output directory> <endianess>\n", prog_name);
+}
+
 int main(int argc, char **argv)
 {
 	int errors = 0;
 	int verbose = 0;
-	
-	if (argc != 4)
+	char *prog_name = argv[0];
+
+	++argv; --argc;
+	while (argc > 0 && argv[0][0] == '-') {
+		if (!strcmp(argv[0], "--no-devtab")) {
+			no_devtab = 1;
+		} else if (!strcmp(argv[0], "--two-pass")) {
+			two_pass = 1;
+		} else {
+			fprintf(stderr, "Illegal option %s\n", argv[0]);
+			usage(prog_name);
+			return 1;
+		}
+		++argv; --argc;
+	}
+	if (argc != 3)
 	{
-		fprintf(stderr, "usage: %s <jffs2 file> <output directory> <endianess>\n", *argv);
+		usage(prog_name);
 		return 1;
 	}
-	
-	FILE *fd = fopen(argv[1], "r");
+
+	FILE *fd = fopen(argv[0], "r");
 	if (!fd)
 	{
-		perror(argv[1]);
+		perror(argv[0]);
 		return 1;
 	}
-	
-	int endianess = atoi(argv[3]);
+
+	int endianess = atoi(argv[2]);
 	if ((endianess != BIG_ENDIAN) && (endianess != LITTLE_ENDIAN))
 	{
 		fprintf(stderr, "endianess must be %d (be) or %d (le)!\n", BIG_ENDIAN, LITTLE_ENDIAN);
 		return 2;
 	}
-	
+
 	swap_words = endianess != BYTE_ORDER;
-	
+
 	while (1)
 	{
 		union jffs2_node_union node;
 		int off = ftell(fd);
 		if (fread(&node, 1, sizeof(node), fd) != sizeof(node))
 			break;
-			
+
 		if (node.u.magic == KSAMTIB_CIGAM_2SFFJ)
 		{
 			fprintf(stderr, "ERROR: reverse endianess detected!\n");
@@ -410,13 +468,13 @@ int main(int argc, char **argv)
 		}
 		if (verbose)
 			printf("at %08x: %04x | %04x (%lu bytes): ", off, fix16(node.u.magic), fix16(node.u.nodetype), fix32(node.u.totlen));
-		
+
 		if (crc32_no_comp(0, (unsigned char*)&node, sizeof(node.u) - 4) != fix32(node.u.hdr_crc))
 		{
 			++errors;
 			printf(" ** wrong crc **\n");
 		}
-		
+
 		switch (fix16(node.u.nodetype))
 		{
 		case JFFS2_NODETYPE_DIRENT:
@@ -427,7 +485,7 @@ int main(int argc, char **argv)
 			name[node.d.nsize] = 0;
 			if (verbose)
 				printf("DIRENT, ino %lu (%s), parent=%lu\n", fix32(node.d.ino), name, fix32(node.d.pino));
-			
+
 			inodes[fix32(node.d.ino)] = name;
 			node_type[fix32(node.d.ino)] = node.d.type;
 			childs[fix32(node.d.pino)].push_back(fix32(node.d.ino));
@@ -452,6 +510,7 @@ int main(int argc, char **argv)
 			if (verbose)
 				printf("  compr_size: %d, uncompr_size: %d\n", compr_size, uncompr_size);
 			unsigned char compr[compr_size], uncomp[uncompr_size];
+			off_t whence = ftello(fd);
 			fread(compr, compr_size, 1, fd);
 			if (crc32_no_comp(0, compr, compr_size) != fix32(node.i.data_crc))
 			{
@@ -461,29 +520,22 @@ int main(int argc, char **argv)
 			{
 				if (verbose)
 					printf("  data crc ok\n");
-				if (do_uncompress(uncomp, uncompr_size, compr, compr_size, node.i.compr) != uncompr_size)
-				{
-					errors++;
-					printf("  ** data uncompress failed!\n");
+				if (!two_pass) {
+					if (do_uncompress(uncomp, uncompr_size, compr, compr_size, node.i.compr) != uncompr_size)
+					{
+						errors++;
+						printf("  ** data uncompress failed!\n");
+					} else
+					{
+						nodedata[fix32(node.i.ino)][fix32(node.i.version)] = nodedata_s(uncomp,
+							uncompr_size, fix32(node.i.offset), fix32(node.i.isize),
+							fix32(node.i.gid), fix32(node.i.uid), fix32(node.i.mode));
+					}
 				} else
 				{
-					nodedata[fix32(node.i.ino)][fix32(node.i.version)] = nodedata_s(uncomp, 
-						uncompr_size, fix32(node.i.offset), fix32(node.i.isize), 
+					nodedata[fix32(node.i.ino)][fix32(node.i.version)] = nodedata_s(fd, whence, uncompr_size, node.i.compr,
+						uncompr_size, fix32(node.i.offset), fix32(node.i.isize),
 						fix32(node.i.gid), fix32(node.i.uid), fix32(node.i.mode));
-#if 0
-					int i;
-					for (i=0; i<((uncompr_size + 15)&~15); ++i)
-					{
-						if ((i & 15) == 0)
-							printf("%08x: ", fix32(node.i.offset) + i);
-						if (i < uncompr_size)
-							printf("%02x ", uncomp[i]);
-						else
-							printf("   ");
-						if ((i & 15) == 15)
-							printf("\n");
-					}
-#endif
 				}
 			}
 			break;
@@ -500,7 +552,7 @@ int main(int argc, char **argv)
 			errors++;
 			printf(" ** INVALID ** - nodetype %04x\n", fix16(node.u.nodetype));
 		}
-		
+
 		if (fix32(node.u.totlen))
 			fseek(fd, (off + fix32(node.u.totlen) + 3) &~3 , SEEK_SET);
 		else
@@ -510,7 +562,7 @@ int main(int argc, char **argv)
 			fseek(fd, (off + ES + 1) & ~ES , SEEK_SET);
 		}
 	}
-	
+
 	if (errors)
 	{
 		if (!inodes.empty())
@@ -522,10 +574,12 @@ int main(int argc, char **argv)
 		}
 	}
 	node_type[1] = DT_DIR;
-	prefix = argv[2];
-	devtab = fopen((prefix + ".devtab").c_str(), "wb");
+	prefix = argv[1];
+	if (!no_devtab)
+		devtab = fopen((prefix + ".devtab").c_str(), "wb");
 	do_list(1);
-	fclose(devtab);
-	
+	if (!no_devtab)
+		fclose(devtab);
+
 	return 0;
 }
